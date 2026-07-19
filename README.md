@@ -1,4 +1,4 @@
-# E-Commerce Recommendation Engine
+# Two-Tower Neural Recommendation Engine
 
 **Two-Tower NCF · InfoNCE Loss · Pinecone ANN · ALS Baseline · LightGBM Ranker · LOO Evaluation**
 
@@ -8,24 +8,24 @@
 
 ## Results
 
-| Metric | ALS Baseline | Popularity | Two-Tower |
-|--------|-------------|------------|-----------|
-| **NDCG@10** | 0.035 | — | pending |
-| **Hit Rate@10** | 0.042 | — | pending |
-| **Recall@10** | 0.042 | — | pending |
-| **MRR** | 0.033 | — | pending |
-| **Catalog Coverage** | — | — | — |
+| Metric | Two-Tower | ALS Baseline | Popularity |
+|--------|-----------|-------------|------------|
+| **NDCG@10** | 0.003 | **0.038** | 0.014 |
+| **Hit Rate@10** | 0.004 | **0.048** | 0.028 |
+| **Recall@10** | 0.004 | **0.038** | 0.026 |
+| **MRR** | 0.002 | **0.033** | 0.010 |
+| **Catalog Coverage** | — | 2.57% | 0.03% |
+| **A/B vs Popularity** | — | p=0.0002 ✅ | baseline |
 
-*Evaluated on 5,654 held-out users via Leave-One-Out protocol (NCF 2017).*
-*Two-Tower metrics pending Pinecone eval — run `python -m src.evaluation.run_eval`.*
+*Evaluated on 2,000 sampled users from 5,334 LOO held-out users (NCF 2017 protocol).*
 
-### Why LOO and not temporal split?
+### Why ALS outperforms Two-Tower here
 
-Olist has a 94% single-purchase rate — 87,704 of 93,358 users bought exactly once.
-Temporal split (any cutoff) yields only ~650 usable test interactions.
-Leave-One-Out holds out each multi-purchase user's last item as the test target,
-giving 5,654 test users with known ground truth — the standard approach for sparse
-e-commerce datasets (He et al., NCF 2017).
+ALS directly factorizes the interaction matrix it is evaluated on — a structural advantage on LOO tasks. Two-Tower trained with in-batch InfoNCE negatives optimizes for embedding space geometry rather than exact item retrieval, and benefits from longer training and richer content signals. On this dataset (94% single-purchase, sparse catalog), CF has a known advantage over neural retrieval. Two-Tower advantage emerges on cold-start users, larger catalogs, and when content features carry strong signal.
+
+### Why LOO and not temporal split
+
+Olist has a 94% single-purchase rate — 88,024 of 93,358 users bought exactly once. Temporal split yields only ~650 usable test interactions regardless of cutoff. Leave-One-Out holds out each multi-purchase user's last item as the test target, giving 5,334 test users with known ground truth — the standard approach for sparse e-commerce datasets (He et al., NCF 2017).
 
 ---
 
@@ -41,11 +41,16 @@ User Tower                              Item Tower
   →  L2-normalize                         →  L2-normalize
 
 Training:  InfoNCE contrastive loss (symmetric, in-batch negatives B=512)
-           Learnable temperature τ: 0.07 → 0.031  ·  30 epochs
+           Learnable temperature τ: 0.067 → 0.029  ·  30 epochs
            AdamW + CosineAnnealingLR  ·  Early stopping (patience=5)
+           Final loss: 3.24 (from 5.30)
 
-Serving:   User embedding → Pinecone ANN (top-100) → LightGBM LambdaRank → top-10
+Serving:   User embedding → Pinecone ANN (top-100 cosine) → LightGBM LambdaRank → top-10
            Redis user embedding cache (1h TTL) · FastAPI · p99 latency <50ms
+
+Ranker:    302,809 training rows · 3,000 users · top feature: als_score (gain 273K)
+           Features: als_score, category_match, item_popularity, avg_review,
+                     log_price, user_avg_price, user_tx_count
 ```
 
 ---
@@ -55,33 +60,33 @@ Serving:   User embedding → Pinecone ANN (top-100) → LightGBM LambdaRank →
 | Component | Technology |
 |-----------|-----------|
 | Two-Tower model | PyTorch |
-| Text embeddings | SBERT (all-MiniLM-L6-v2) |
+| Text embeddings | SBERT (all-MiniLM-L6-v2, 384d) |
 | ALS baseline | implicit (Ben Frederickson) |
-| ANN index | Pinecone Serverless (free tier) |
+| ANN index | Pinecone Serverless (free tier, 30,838 vectors) |
 | Stage-2 ranker | LightGBM LambdaRank |
-| Evaluation | NDCG@k, HR@k, Recall@k, MRR, LOO |
-| Experiment tracking | MLflow |
+| Evaluation | NDCG@10, HR@10, Recall@10, MRR, LOO protocol |
 | API | FastAPI + asyncio |
 | Caching | Redis (1h TTL) |
-| Demo | Streamlit |
-| Data transforms | pandas + dbt |
+| Demo | Streamlit (auto-loads real metrics) |
+| Data transforms | pandas |
 
 ---
 
 ## Dataset
 
-**Olist Brazilian E-Commerce** — free Kaggle download.
+**Olist Brazilian E-Commerce** — free Kaggle download, no registration required.
 
 | Metric | Value |
 |--------|-------|
 | Total orders | 99,441 |
 | Total interactions | 100,380 |
-| Training interactions | 94,726 |
+| Training interactions | 94,451 |
 | Users | 93,358 |
 | Products | 32,951 |
-| Products in training | 30,928 |
-| Test users (LOO) | 5,654 |
-| Single-purchase users | 87,704 (94%) |
+| Products in training | 30,838 |
+| Test users (LOO) | 5,334 |
+| Single-purchase users | 88,024 (94%) |
+| Multi-purchase users | 5,334 (6%) |
 | Date range | Jan 2017 – Aug 2018 |
 
 ---
@@ -104,6 +109,7 @@ kaggle datasets download -d olistbr/brazilian-ecommerce -p data/raw --unzip
 ```bash
 python -m src.data.build_features
 # ~2 min: LOO split + SBERT encoding of 32K products
+# Output: 94,451 train interactions | 5,334 test users
 ```
 
 ### 4. Train ALS baseline
@@ -111,42 +117,48 @@ python -m src.data.build_features
 export MLFLOW_ALLOW_FILE_STORE=true
 python -m src.models.train_als
 # ~1 min on CPU
+# Output: NDCG@10 0.038 · HR@10 0.048 · Recall@10 0.048
 ```
 
 ### 5. Train Two-Tower
 ```bash
 python -m src.models.train_two_tower
-# ~12 min on Apple MPS / ~1 hr on CPU / ~1 hr on Colab T4
+# ~12 min on Apple MPS / ~1 hr on Colab T4
+# Output: loss 5.30 → 3.24 over 30 epochs
 ```
 
 ### 6. Build Pinecone index
 ```bash
 export PINECONE_API_KEY=your_key
 python -m src.index.build_index
-# Encodes 32K items → upserts to Pinecone
+# Encodes 30,838 items → upserts 128-dim embeddings to Pinecone
 ```
 
 ### 7. Train LightGBM ranker
 ```bash
 python -m src.models.train_ranker
-# ~5 min — builds ALS candidates → trains re-ranker
+# ~5 min: 302K training rows from 3,000 users
 ```
 
-### 8. Evaluate (get real metrics)
+### 8. Run full evaluation
 ```bash
+export PINECONE_API_KEY=your_key
 python -m src.evaluation.run_eval
+# Evaluates ALS + Popularity + Two-Tower on 2,000 test users
 # Saves results to data/processed/eval_results.json
+# A/B test: ALS vs Popularity p=0.0002 (statistically significant)
 ```
 
-### 9. Run demo
+### 9. Launch demo
 ```bash
 streamlit run app/streamlit_app.py
-# Streamlit auto-loads real metrics from eval_results.json
+# Auto-loads real metrics from eval_results.json
 ```
 
 ### 10. Serve API
 ```bash
 uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
+# Endpoints: POST /recommend · GET /health · GET /item/{id}
 ```
 
 ---
@@ -154,73 +166,60 @@ uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
 ## Repository Structure
 
 ```
-ecommerce-recsys/
+Two-Tower-Neural-Recommendation-Engine/
 ├── README.md
 ├── requirements.txt
 ├── .env.example
 ├── .gitignore
 │
-├── data/
-│   ├── raw/              # Olist CSVs (gitignored)
-│   ├── processed/        # features, embeddings, id maps, eval results
-│   └── splits/           # LOO train/test parquet files
-│
 ├── src/
 │   ├── data/
-│   │   ├── loader.py         # LOO split logic + sparse matrix builder
-│   │   ├── dataset.py        # TwoTowerDataset (PyTorch)
-│   │   └── build_features.py # SBERT encoding + feature tables
+│   │   ├── loader.py           # LOO split · sparse matrix builder
+│   │   ├── dataset.py          # TwoTowerDataset (PyTorch)
+│   │   └── build_features.py   # SBERT encoding · feature tables
 │   │
 │   ├── models/
-│   │   ├── two_tower.py        # UserTower + ItemTower + TwoTowerModel
-│   │   ├── infonce_loss.py     # Symmetric InfoNCE + weighted variant
+│   │   ├── two_tower.py        # UserTower · ItemTower · TwoTowerModel
+│   │   ├── infonce_loss.py     # Symmetric InfoNCE · weighted variant
 │   │   ├── als_model.py        # ALS implicit CF wrapper
-│   │   ├── lgbm_ranker.py      # LightGBM LambdaRank features
-│   │   ├── train_two_tower.py  # Training loop + early stopping
-│   │   ├── train_als.py        # ALS training + LOO eval
-│   │   └── train_ranker.py     # LightGBM ranker training
+│   │   ├── train_two_tower.py  # Training loop · early stopping · MPS/CUDA
+│   │   ├── train_als.py        # ALS training · LOO evaluation
+│   │   └── train_ranker.py     # LightGBM LambdaRank training
 │   │
 │   ├── embeddings/
-│   │   └── user_encoder.py   # Online user tower inference
+│   │   └── user_encoder.py     # Online user tower inference
 │   │
 │   ├── index/
-│   │   ├── pinecone_client.py # Upsert + ANN query
-│   │   └── build_index.py    # Batch encode items → Pinecone
+│   │   ├── pinecone_client.py  # Upsert · ANN query
+│   │   └── build_index.py      # Batch encode items → Pinecone
 │   │
 │   ├── evaluation/
-│   │   ├── metrics.py        # NDCG@k, HR@k, Recall@k, MRR, coverage
-│   │   └── run_eval.py       # Full eval + A/B test + JSON output
+│   │   ├── metrics.py          # NDCG@k · HR@k · Recall@k · MRR · coverage
+│   │   └── run_eval.py         # Full eval · A/B test · JSON output
 │   │
 │   └── api/
-│       └── main.py           # FastAPI: /recommend, /health, /item/{id}
+│       └── main.py             # FastAPI: /recommend · /health · /item/{id}
 │
 ├── app/
-│   └── streamlit_app.py      # Professional SaaS demo UI
+│   └── streamlit_app.py        # Professional SaaS demo · 3-model comparison
 │
 └── tests/
-    ├── test_metrics.py       # Metric unit tests (18 tests)
-    └── test_two_tower.py     # Model + loss unit tests (9 tests)
+    ├── test_metrics.py         # 18 metric unit tests
+    └── test_two_tower.py       # 8 model + loss unit tests
 ```
 
 ---
 
-## Resume Bullets
+## Key Design Decisions
 
-```
-• Built Two-Tower NCF recommendation engine on Olist 100K interactions
-  (93K users · 33K products); identified 94% single-purchase rate,
-  implemented Leave-One-Out evaluation (NCF 2017) on 5,654 held-out users
+**InfoNCE over BPR loss** — BPR samples 1 negative per step. InfoNCE uses all B−1 in-batch items as negatives simultaneously (B=512), giving 511× more signal per step. In-batch negatives naturally skew toward popular items (hard negatives), reducing popularity bias.
 
-• ALS baseline: NDCG@10 0.035 · Hit Rate@10 0.042 · Recall@10 0.042 · MRR 0.033
-  Two-Tower: pending Pinecone eval (run_eval.py)
+**L2-normalised embeddings** — dot product of unit vectors equals cosine similarity. Makes embedding space uniform (no magnitude variation), critical for Pinecone ANN quality, and makes temperature τ interpretable.
 
-• Indexed 27,524 product embeddings (128-dim, SBERT 384-dim content features)
-  in Pinecone Serverless ANN; Two-Tower + LightGBM LambdaRank re-ranker pipeline
+**Two-stage retrieval** — end-to-end ranking over 31K items per request is O(N·D). Pinecone ANN retrieval in O(D log N) gets top-100 candidates in <10ms, then LightGBM reranks cheaply. Industry standard at YouTube, Pinterest, Airbnb.
 
-• Deployed FastAPI serving with Redis user-embedding cache (1h TTL);
-  p99 latency <50ms; 3-model comparison Streamlit demo
-```
+**LOO evaluation** — temporal split is infeasible on Olist (94% single-purchase rate). LOO on 5,334 multi-purchase users follows the NCF 2017 evaluation standard and gives meaningful, comparable metrics.
 
 ---
 
-*Built by Bhavya Lakkamraju — bhavyalakkamraju09.github.io*
+*Built by Bhavya Lakkamraju — [bhavyalakkamraju09.github.io](https://bhavyalakkamraju09.github.io)*
