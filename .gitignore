@@ -1,0 +1,33 @@
+# Data — too large for GitHub
+data/raw/
+data/processed/
+data/splits/
+
+# Model checkpoints — too large for GitHub
+checkpoints/
+
+# MLflow
+mlruns/
+mlruns.db
+
+# Python
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# Environment
+.env
+*.pkl
+*.pth
+*.npy
+
+# Streamlit
+.streamlit/
+
+# macOS
+.DS_Store
+._*
+.DS_Store
