@@ -31,3 +31,4 @@ __pycache__/
 .DS_Store
 ._*
 .DS_Store
+!data/processed/eval_results.json
